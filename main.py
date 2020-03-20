@@ -145,7 +145,7 @@ class Main(object):
 
 		if use_houdini:
 			houdini = Houdini.apply
-			loss_fn = lambda Y_pred, Y : houdini(Y_pred, Y, per_image_iou(Y_pred, Y), ignore_index=255)
+			loss_fn = lambda Y_pred, Y : -1.0 * houdini(Y_pred, Y, per_image_iou(Y_pred, Y), ignore_index=255)
 			adv 	= Adversarial(loss_fn, pixel_min = -np.array(self.mean), pixel_max = 255-np.array(self.mean))
 		else:
 			adv 	= Adversarial(self.loss_fn, pixel_min = -np.array(self.mean), pixel_max = 255-np.array(self.mean))
@@ -158,23 +158,42 @@ class Main(object):
 		for batch_num, batch in enumerate(self.get_batches(self.data, split=split, batch_size=self.p.batch_size)):
 
 			X, Y 	= self.process_batch(batch)
+
+			if batch_num == 0:
+				X_target, Y_target = X, Y
+				continue
 			X1 		= X[:, :, :, :1024]
 			X2 		= X[:, :, :, 1024:]
 			Y1  	= Y[:, :, :1024]
 			Y2  	= Y[:, :, 1024:]
-			X1_adv 	= adv.pgd_perturb(X1, Y1, self.model, k=self.p.k, a=self.p.a, epsilon=self.p.pgd_eps, target='untargeted', rand_start=True)
-			X2_adv 	= adv.pgd_perturb(X2, Y2, self.model, k=self.p.k, a=self.p.a, epsilon=self.p.pgd_eps, target='untargeted', rand_start=True)
+			Y1_target = Y_target[:, :, :1024]
+			Y2_target = Y_target[:, :, 1024:]
+			X1_adv 	= adv.pgd_perturb(X1, Y1, self.model, k=self.p.k, a=self.p.a, epsilon=self.p.pgd_eps, target=Y1_target, rand_start=True)
+			X2_adv 	= adv.pgd_perturb(X2, Y2, self.model, k=self.p.k, a=self.p.a, epsilon=self.p.pgd_eps, target=Y2_target, rand_start=True)
 			X_adv 	= torch.cat((X1_adv, X2_adv), axis=3)
 
 			with torch.no_grad():
-				Y_pred  	= self.model.forward(X_adv)
-				batch_hist 	= fast_hist(Y_pred, Y, self.num_classes)
+				Y_adv 		= self.model.forward(X_adv)
+				batch_hist 	= fast_hist(Y_adv, Y, self.num_classes)
 				hist 		+= batch_hist
 				batch_mIoU 	= iou_from_hist(batch_hist)
 				batch_target_mIoU = -1.0
 
+				if self.p.debug:
+					Y_pred = self.model.forward(X)
+					import pdb; pdb.set_trace()
+					self.visualize_seg(torch.argmax(Y_adv, dim=1)[0], 'images/adv_segmentation.png')
+					self.visualize_seg(torch.argmax(Y_pred, dim=1)[0], 'images/segmentation.png')
+					self.visualize_seg(Y[0], 'images/ground_truth.png')
+					self.save_as_img(X[0], 'images/input.png')
+
+					self.visualize_seg(Y_target[0], 'images/target_gt.png')
+					self.save_as_img(X_target[0], 'images/target_input.png')
+					self.save_as_img(X_adv[0], 'images/adv_input.png')
+					exit(0)
+
 			new_X.append(X_adv.cpu().numpy())
-			new_Y.append(Y.cpu().numpy())
+			new_Y.append(Y_pred.cpu().numpy())
 
 			self.logger.info("PGD batch : {}, IoU : {:.4}, Target IoU : {:.4}".format(batch_num, batch_mIoU, batch_target_mIoU))
 
@@ -224,4 +243,4 @@ if __name__== "__main__":
 
 	main = Main(args)
 
-	main.pgd_attack(split='val', approx=True)
+	main.pgd_attack(split='val', use_houdini=False, approx=True)
