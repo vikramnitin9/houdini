@@ -61,15 +61,26 @@ def set_gpu(gpus):
 	os.environ["CUDA_DEVICE_ORDER"]    = "PCI_BUS_ID"
 	os.environ["CUDA_VISIBLE_DEVICES"] = gpus
 
-def fast_hist(pred, label, n):
+def fast_hist(Y_pred, Y, n):
+    assert n == Y_pred.shape[1]
+    pred    = torch.argmax(Y_pred, dim=1)
+    pred    = pred.cpu().detach().numpy().flatten()
+    label   = Y.cpu().detach().numpy().flatten()
     k = (label >= 0) & (label < n)
     return np.bincount(
         n * label[k].astype(int) + pred[k], minlength=n ** 2).reshape(n, n)
 
-def per_class_iu(hist):
-    return np.diag(hist) / (hist.sum(1) + hist.sum(0) - np.diag(hist))
+def iou_from_hist(hist):
+    ious = 100 * np.diag(hist) / (hist.sum(1) + hist.sum(0) - np.diag(hist) + 1e-10)
+    mask = ((hist.sum(1) > 0) & (~np.isnan(ious))) # If a particular class is missing from labels, don't include it
+    mIoU = np.nansum(ious * mask) / np.sum(mask)
+    return mIoU
 
-def per_image_fast_hist(pred, label, n):
+def per_image_fast_hist(Y_pred, Y, n):
+    pred        = torch.argmax(Y_pred, dim=1)
+    pred        = pred.cpu().detach().numpy().reshape(pred.shape[0], -1)
+    label       = Y.cpu().detach().numpy().reshape(Y.shape[0], -1)
+
     k           = (label >= 0) & (label < n)
     label[~k]   = n
     temp        = np.apply_along_axis(np.bincount, 1, n * label.astype(int) + pred, minlength=(n**2) + n)
@@ -77,21 +88,14 @@ def per_image_fast_hist(pred, label, n):
 
     return temp.reshape(pred.shape[0], n, n)
 
-def per_image_per_class_iu(hist):
-    diag = np.diagonal(hist, axis1=1, axis2=2)
-
-    return diag / (hist.sum(2) + hist.sum(1) - diag + 1e-10)
-
 def per_image_iou(Y_pred, Y):
-    num_classes         = Y_pred.shape[1]
+    num_classes = Y_pred.shape[1]
 
-    class_prediction    = torch.argmax(Y_pred, dim=1)
-    class_prediction    = class_prediction.cpu().detach().numpy().reshape(class_prediction.shape[0], -1)
-    target_seg          = Y.cpu().detach().numpy().reshape(Y.shape[0], -1)
-
-    hist                = per_image_fast_hist(class_prediction, target_seg, num_classes)
-    ious                = per_image_per_class_iu(hist) * 100
-    mIoU                = np.nanmean(ious, axis=1)
-    mIoU                = torch.Tensor(mIoU).to(Y_pred.device)
+    hist        = per_image_fast_hist(Y_pred, Y, num_classes)
+    diag        = np.diagonal(hist, axis1=1, axis2=2)
+    ious        = 100 * diag / (hist.sum(2) + hist.sum(1) - diag + 1e-10)
+    mask        = ((hist.sum(2) > 0) & (~np.isnan(ious))) # If a particular class is missing from labels, don't include it
+    mIoU        = np.nansum(ious * mask, axis=1) / np.sum(mask, axis=1)
+    mIoU        = torch.Tensor(mIoU).to(Y_pred.device)
 
     return mIoU

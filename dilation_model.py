@@ -6,6 +6,8 @@ class Dilation10(nn.Module):
 
 		super(Dilation10, self).__init__()
 
+		self.pad 		= nn.ReflectionPad2d(186)
+
 		self.conv1_1	= nn.Conv2d(in_channels=3,		out_channels=64,	kernel_size=3, 	dilation=1)
 		self.conv1_2	= nn.Conv2d(in_channels=64,  	out_channels=64,  	kernel_size=3, 	dilation=1)
 		self.pool1 		= nn.MaxPool2d(kernel_size=2, stride=2)
@@ -48,6 +50,8 @@ class Dilation10(nn.Module):
 		self.ctx_upsample = nn.ConvTranspose2d(in_channels=19, out_channels=19, kernel_size=16, stride=8, padding=4, groups=19, bias=False)
 
 	def forward(self, x):
+		x = self.pad(x)
+
 		x = F.relu(self.conv1_1(x))
 		x = F.relu(self.conv1_2(x))
 		x = self.pool1(x)
@@ -87,6 +91,6 @@ class Dilation10(nn.Module):
 		x = F.relu(self.ctx_fc1(x))
 		x = self.ctx_final(x)
 
-		x = F.softmax(self.ctx_upsample(x), dim=1)
+		x = self.ctx_upsample(x)
 
 		return x

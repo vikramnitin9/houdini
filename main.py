@@ -1,5 +1,5 @@
 from helper import *
-from adversarial import Adversarial
+from adversarial import Adversarial, Houdini
 from dilation_model import Dilation10
 
 class Main(object):
@@ -25,7 +25,6 @@ class Main(object):
 
 	def load_data(self):
 		# Image size 1024x2048
-		self.margin 		= 186
 		self.mean 			= (73.16, 82.91, 72.39)
 		self.num_classes 	= 19
 
@@ -44,12 +43,10 @@ class Main(object):
 		data_transform 		= transforms.Compose([
 									lambda x : torch.from_numpy(np.array(x, np.float32, copy=False)),
 									lambda x : x.permute(2, 0, 1),
-									# lambda x : torch.flip(x, (0,)), # RGB to BGR expected by the model
 									transforms.Normalize(self.mean, (1.0, 1.0, 1.0)),
-									# lambda x : nn.ReflectionPad2d(self.margin)(x.unsqueeze(0)).squeeze(0)
 								])
 		target_transform 	= transforms.Compose([
-									lambda x : torch.from_numpy(np.array(x, np.int32, copy=False)).unsqueeze(0),
+									lambda x : torch.from_numpy(np.array(x, np.int32, copy=False)),
 									RemapClasses(class_remapping)
 								])
 		data = {}
@@ -79,58 +76,57 @@ class Main(object):
 		else:
 			self.device = torch.device('cpu')
 
-		self.data = self.load_data()
-		self.model = self.add_model()
+		self.data 		= self.load_data()
+		self.model 		= self.add_model()
+		self.loss_fn 	= torch.nn.CrossEntropyLoss(ignore_index=255)
 
-		self.load_model('pretrained/dilation10_cityscapes_RGB.pth')
+		self.load_model('pretrained/dilation10_cityscapes.pth')
 
 	def save_model(self, model, path):
 		torch.save(model.state_dict(), path)
 
 	def load_model(self, path):
-		self.model.load_state_dict(torch.load(path))
+		self.model.load_state_dict(torch.load(path, map_location=self.device))
 
-	def predict(self, model, data, split):
+	def predict(self, model, loss_fn, data, split):
 		model.eval()
-		ious 	= []
+		losses 	= []
 		hist 	= np.zeros((self.num_classes, self.num_classes))
-		pad  	= nn.ReflectionPad2d(self.margin)
 
 		for step, batch in enumerate(self.get_batches(data, split=split, batch_size=self.p.batch_size)):
 			X, Y 	= self.process_batch(batch)
 
-			print("Step {}".format(step))
-
 			with torch.no_grad():
-				Y_pred 				= model.forward(pad(X))
-				class_prediction  	= torch.argmax(Y_pred, dim=1)
+				Y_pred 	= model.forward(X)
+				loss 	= loss_fn(Y_pred, Y)
 				if self.p.debug:
-					self.visualize_seg(class_prediction[0], 'segmentation.png')
-					self.visualize_seg(Y[0, 0], 'ground_truth.png')
+					self.visualize_seg(torch.argmax(Y_pred, dim=1)[0], 'segmentation.png')
+					self.visualize_seg(Y[0], 'ground_truth.png')
 					self.save_as_img(X[0], 'input.png')
 					exit(0)
-				class_prediction    = class_prediction.cpu().detach().numpy().flatten()
-				target_seg          = Y.cpu().detach().numpy().flatten()
-				hist 				+= fast_hist(class_prediction, target_seg, self.num_classes)
+				batch_hist 	= fast_hist(Y_pred, Y, self.num_classes)
+				hist 		+= batch_hist
+				batch_mIoU 	= iou_from_hist(batch_hist)
+				losses.append(loss.item())
 
-		ious = per_class_iu(hist) * 100
-		mIoU = np.nanmean(ious)
+			self.logger.info("Prediction batch : {}, IoU : {:.4}, Loss : {:.4}".format(step, batch_mIoU, loss.item()))
 
-		print("mIoU : {:.4}".format(mIoU))
+		mIoU = iou_from_hist(hist)
 
-		return mIoU
+		print("Loss : {:.4}, mIoU : {:.4}".format(np.mean(losses), mIoU))
+
+		return np.mean(losses), mIoU
 
 	def eval(self, split='train'):
-		val_iou		= self.predict(self.model, self.data, 'val')
-		test_iou    = self.predict(self.model, self.data, 'test')
+		val_loss, val_iou	= self.predict(self.model, self.loss_fn, self.data, 'val')
+		_, test_iou    		= self.predict(self.model, self.loss_fn, self.data, 'test')
 
-		self.logger.info('[Evaluation]: Valid IoU: {:.4}, Test IoU : {:5}'.format(val_iou, test_iou))
+		self.logger.info('[Evaluation]: Valid Loss: {:.4}, Valid IoU: {:.4}, Test IoU : {:5}'.format(val_loss, val_iou, test_iou))
 
 	def save_as_img(self, x, fname):
 		if isinstance(x, torch.Tensor): x = np.array(x.detach().cpu())
 		x 	+= np.array(self.mean).reshape(3, 1, 1)
 		x 	= np.uint8(x.transpose(1, 2, 0))
-		x 	= x[self.margin : -self.margin, self.margin : -self.margin]
 		im 	= Image.fromarray(x)
 		im.save(fname)
 
@@ -141,48 +137,54 @@ class Main(object):
 		im 	= Image.fromarray(x)
 		im.save(fname)
 
-	def pgd_attack(self, split='val', approx=False):
+	def pgd_attack(self, split='val', use_houdini=False, approx=False):
 		self.model.eval()
-		losses, accs, targ_accs = [], [], []
 
-		old_loss, old_acc = self.predict(self.model, self.loss_fn, self.data, split)
+		# old_loss, old_iou = self.predict(self.model, self.loss_fn, self.data, split)
 		self.logger.info("Running PGD attack on {} set".format(split))
 
-		target_class = 'untargeted'
+		if use_houdini:
+			houdini = Houdini.apply
+			loss_fn = lambda Y_pred, Y : houdini(Y_pred, Y, per_image_iou(Y_pred, Y), ignore_index=255)
+			adv 	= Adversarial(loss_fn, pixel_min = -np.array(self.mean), pixel_max = 255-np.array(self.mean))
+		else:
+			adv 	= Adversarial(self.loss_fn, pixel_min = -np.array(self.mean), pixel_max = 255-np.array(self.mean))
 
-		adv = Adversarial(self.loss_fn)
+		hist = np.zeros((self.num_classes, self.num_classes))
 
 		new_X = []
 		new_Y = []
 
-		for step, batch in enumerate(self.get_batches(self.data, split=split, batch_size=self.p.batch_size)):
+		for batch_num, batch in enumerate(self.get_batches(self.data, split=split, batch_size=self.p.batch_size)):
 
 			X, Y 	= self.process_batch(batch)
-			X_adv 	= adv.pgd_perturb(X, Y, self.model, k=self.p.k, a=self.p.a, epsilon=self.p.pgd_eps, target=target_class, rand_start=True)
+			X1 		= X[:, :, :, :1024]
+			X2 		= X[:, :, :, 1024:]
+			Y1  	= Y[:, :, :1024]
+			Y2  	= Y[:, :, 1024:]
+			X1_adv 	= adv.pgd_perturb(X1, Y1, self.model, k=self.p.k, a=self.p.a, epsilon=self.p.pgd_eps, target='untargeted', rand_start=True)
+			X2_adv 	= adv.pgd_perturb(X2, Y2, self.model, k=self.p.k, a=self.p.a, epsilon=self.p.pgd_eps, target='untargeted', rand_start=True)
+			X_adv 	= torch.cat((X1_adv, X2_adv), axis=3)
 
 			with torch.no_grad():
-				Y_pred  = self.model.forward(X_adv)
-
-			loss 		= self.loss_fn(Y_pred, Y).mean()
-			acc     	= self.get_acc(Y_pred, Y)
-			if target_class != 'untargeted':
-				targ_acc	= self.get_acc(Y_pred, target_class * torch.ones_like(Y))
-			else:
-				targ_acc 	= torch.tensor(-1.0).to(self.device)
+				Y_pred  	= self.model.forward(X_adv)
+				batch_hist 	= fast_hist(Y_pred, Y, self.num_classes)
+				hist 		+= batch_hist
+				batch_mIoU 	= iou_from_hist(batch_hist)
+				batch_target_mIoU = -1.0
 
 			new_X.append(X_adv.cpu().numpy())
 			new_Y.append(Y.cpu().numpy())
 
-			self.logger.info("PGD batch : {}, Accuracy : {:.4}, Target Success : {:.4}".format(step, acc, targ_acc))
+			self.logger.info("PGD batch : {}, IoU : {:.4}, Target IoU : {:.4}".format(batch_num, batch_mIoU, batch_target_mIoU))
 
-			losses.append(loss.item())
-			accs.append(acc.item())
-			targ_accs.append(targ_acc.item())
+			if approx and batch_num == 10: break
 
-			if approx and step == 10: break
+		mIoU = iou_from_hist(hist)
+		target_mIoU = -1.0
 
-		self.logger.info("Before attack : Accuracy {}".format(old_acc))
-		self.logger.info("After attack : Accuracy {}, Target Success : {:.4}". format(np.mean(accs), np.mean(targ_accs)))
+		self.logger.info("Before attack : IoU {}".format(old_iou))
+		self.logger.info("After attack : IoU {}, Target IoU : {:.4}". format(mIoU, target_mIoU))
 
 		new_X = np.concatenate(new_X, axis=0)
 		new_Y = np.concatenate(new_Y, axis=0)
@@ -207,8 +209,8 @@ if __name__== "__main__":
 	# PGD params
 	parser.add_argument('-pgd',			dest="pgd",			action='store_true',			help='PGD?')
 	parser.add_argument('-k', 			dest="k", 			default=10,		type=int,		help='PGD k')
-	parser.add_argument('-a', 			dest="a", 			default=2./255,	type=float,		help='PGD a')
-	parser.add_argument('-pgd_eps',		dest="pgd_eps",		default=8./255,	type=float,		help='PGD epsilon')
+	parser.add_argument('-a', 			dest="a", 			default=2,		type=float,		help='PGD a')
+	parser.add_argument('-pgd_eps',		dest="pgd_eps",		default=8,		type=float,		help='PGD epsilon')
 
 	args = parser.parse_args()
 
@@ -222,4 +224,4 @@ if __name__== "__main__":
 
 	main = Main(args)
 
-	main.eval()
+	main.pgd_attack(split='val', approx=True)
