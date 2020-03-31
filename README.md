@@ -3,4 +3,4 @@ An implementation of [Houdini : Fooling Deep Structured Prediction Models](https
 
 ![Illustration](/images/readme_img.png)
 
-The pretrained Dilation10 weights can be downloaded from [this link](https://www.dropbox.com/s/wk7zviagkz1cumd/dilation10_cityscapes.pth?dl=0).
+The pretrained Dilation10 weights can be downloaded from [this link](https://drive.google.com/open?id=1k_2zRHiw46jhhDdWa_ny1Om3ea36HMIG).
